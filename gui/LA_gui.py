@@ -70,7 +70,12 @@ SAMPLE_RATES = [
 ]
 
 FIXED_BUFFER_SIZE = 256
-MAX_DISPLAY_SAMPLES = 4096
+# GUI RAM is bounded: only the newest samples are kept for display.
+MAX_DISPLAY_SAMPLES = 10_000
+MAX_DECODE_SAMPLES = 4_096
+PLOT_REFRESH_MS = 50                 # 20 FPS; serial RX stays more frequent
+LIVE_DECODE_INTERVAL_MS = 1_500      # avoid running protocol inference per UART chunk
+BLOCK_REARM_IDLE_SECONDS = 0.030     # restart a completed FPGA block after UART goes idle
 
 
 class FramedParser:
@@ -542,14 +547,21 @@ class LogicAnalyzerWindow(QMainWindow):
         self.batch_size = FIXED_BUFFER_SIZE
         self.batch_received = 0
         self.last_rx_time = 0.0
-        self.target_sample_count = FIXED_BUFFER_SIZE
-        self.auto_stop_scheduled = False
+        self.rearm_count = 0
         self.has_new_data = False
 
         self.raw_capture: RawTriggerCapture | None = None
         self.protocol_mode = "framed"
         self.sample_rate = 1_000_000
         self.auto_follow = True
+        # Trigger marker: sample index in the absolute DATA stream. The GUI
+        # detects the selected condition from received channel samples and
+        # displays the most recent matching event in the LIVE window.
+        self.trigger_previous_bit: int | None = None
+        self.trigger_sample_index: int | None = None
+        self.trigger_event_count = 0
+        self.trigger_marker: pg.InfiniteLine | None = None
+        self.trigger_marker_label: pg.TextItem | None = None
         self.decoder_row_cache: list[dict[str, str]] = []
         self.curves: list[pg.PlotDataItem] = []
 
@@ -561,6 +573,18 @@ class LogicAnalyzerWindow(QMainWindow):
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(8)
         self.poll_timer.timeout.connect(self._poll_serial)
+
+        # Decouple UART reading from waveform rendering. The RX timer keeps
+        # draining serial data; the plot timer refreshes at a bounded frame rate.
+        self.plot_timer = QTimer(self)
+        self.plot_timer.setInterval(PLOT_REFRESH_MS)
+        self.plot_timer.timeout.connect(self._flush_live_plot)
+
+        # Protocol inference is more expensive than plotting, so run it on a
+        # slower timer using only the newest MAX_DECODE_SAMPLES samples.
+        self.decoder_timer = QTimer(self)
+        self.decoder_timer.setSingleShot(True)
+        self.decoder_timer.timeout.connect(self._decode_live_snapshot)
 
         self.watchdog_timer = QTimer(self)
         self.watchdog_timer.setInterval(500)
@@ -601,20 +625,15 @@ class LogicAnalyzerWindow(QMainWindow):
         self.connect_button.setFixedSize(82, 32)
         self.connect_button.clicked.connect(self.connect_uart)
 
+        # One toggle button: RUN while idle, STOP while acquiring.
         self.run_button = QPushButton("▶ RUN")
         self.run_button.setObjectName("runButton")
-        self.run_button.setFixedSize(64, 32)
-        self.run_button.clicked.connect(self.start_acquisition)
-
-        self.stop_button = QPushButton("■ STOP")
-        self.stop_button.setObjectName("stopButton")
-        self.stop_button.setFixedSize(66, 32)
-        self.stop_button.clicked.connect(lambda: self.stop_acquisition(send_command=True))
-        self.stop_button.setEnabled(False)
+        self.run_button.setFixedSize(76, 32)
+        self.run_button.setToolTip("Bắt đầu nhận dữ liệu LIVE")
+        self.run_button.clicked.connect(self.toggle_acquisition)
 
         action.addWidget(self.connect_button)
         action.addWidget(self.run_button)
-        action.addWidget(self.stop_button)
         action.addSpacing(4)
 
         fs_label = QLabel("Fs")
@@ -675,7 +694,7 @@ class LogicAnalyzerWindow(QMainWindow):
         self.capture_label.setObjectName("muted")
         self.capture_label.setMinimumWidth(0)
         self.capture_label.setMaximumWidth(205)
-        self.capture_label.setToolTip("Trạng thái thu thập dữ liệu UART")
+        self.capture_label.setToolTip("Trạng thái LIVE, số byte UART và số mẫu đã nhận")
         action.addWidget(self.capture_label, 1)
         root.addWidget(action_frame)
 
@@ -691,7 +710,7 @@ class LogicAnalyzerWindow(QMainWindow):
 
         self.setCentralWidget(central)
         self.statusBar().showMessage(
-            f"Nhấn Connect để kết nối {UART_PORT} @ {UART_BAUDRATE} baud"
+            f"LIVE: Connect {UART_PORT}, sau đó RUN để xem dữ liệu liên tục"
         )
 
     def _selected_pre_samples(self) -> int:
@@ -758,8 +777,31 @@ class LogicAnalyzerWindow(QMainWindow):
             curve.setVisible(False)
             self.curves.append(curve)
 
+        # Bright yellow vertical marker at the most recent detected trigger sample.
+        # It spans the waveform and remains visible while its sample is inside the sliding window.
+        self.trigger_marker = pg.InfiniteLine(
+            pos=0,
+            angle=90,
+            movable=False,
+            pen=pg.mkPen("#FFEB3B", width=3, style=Qt.PenStyle.SolidLine),
+        )
+        self.trigger_marker.setZValue(30)
+        self.trigger_marker.setVisible(False)
+        self.plot.addItem(self.trigger_marker)
+
+        self.trigger_marker_label = pg.TextItem(
+            text="T",
+            color="#FFEB3B",
+            anchor=(0.5, 0),
+            fill=pg.mkBrush(30, 35, 43, 210),
+            border=pg.mkPen("#FFEB3B", width=1.5),
+        )
+        self.trigger_marker_label.setZValue(31)
+        self.trigger_marker_label.setVisible(False)
+        self.plot.addItem(self.trigger_marker_label)
+
         self.placeholder = pg.TextItem(
-            f"Chưa có dữ liệu\nNhấn Connect {UART_PORT} rồi nhấn RUN để vẽ tức thì",
+            f"Chưa có dữ liệu\nNhấn Connect {UART_PORT} rồi RUN để xem LIVE",
             color="#758294",
             anchor=(0.5, 0.5),
         )
@@ -826,7 +868,7 @@ class LogicAnalyzerWindow(QMainWindow):
             self.decoder_row_cache.append({
                 "protocol": "Chưa có dữ liệu",
                 "bit": "—",
-                "tooltip": "Nhấn RUN để thu và tự động phân tích kênh này.",
+                "tooltip": "Nhấn RUN để xem waveform LIVE và tự động phân tích kênh này.",
             })
 
         outer.addWidget(self.decoder_table, 1)
@@ -878,7 +920,7 @@ class LogicAnalyzerWindow(QMainWindow):
             {
                 "protocol": "Chưa có dữ liệu",
                 "bit": "—",
-                "tooltip": "Nhấn RUN để thu và tự động phân tích kênh này.",
+                "tooltip": "Nhấn RUN để xem waveform LIVE và tự động phân tích kênh này.",
             }
             for _ in range(8)
         ]
@@ -897,7 +939,8 @@ class LogicAnalyzerWindow(QMainWindow):
             self._reset_decoder_table()
             return
 
-        samples = np.frombuffer(bytes(self.capture_data), dtype=np.uint8)
+        decode_tail = self.capture_data[-MAX_DECODE_SAMPLES:]
+        samples = np.frombuffer(bytes(decode_tail), dtype=np.uint8)
         fs = float(self.sample_rate)
         records: list[dict[str, str]] = []
         for channel in range(8):
@@ -1201,6 +1244,10 @@ class LogicAnalyzerWindow(QMainWindow):
     def _close_serial(self) -> None:
         self.poll_timer.stop()
         self.watchdog_timer.stop()
+        if hasattr(self, "plot_timer"):
+            self.plot_timer.stop()
+        if hasattr(self, "decoder_timer"):
+            self.decoder_timer.stop()
         if self.ser is not None:
             try:
                 if self.ser.is_open:
@@ -1215,8 +1262,14 @@ class LogicAnalyzerWindow(QMainWindow):
         if self.acquiring:
             self.acquiring = False
             self._set_running_ui(False)
+            self.plot_timer.stop()
+            self.decoder_timer.stop()
+            if self.has_new_data:
+                self._flush_live_plot()
             self.capture_label.setText(f"Mất kết nối {UART_PORT} · {self.total_received:,} mẫu")
-            self.trigger_state_label.setText("Trigger: ngắt do mất kết nối")
+            self.trigger_state_label.setText("LIVE: ngắt do mất kết nối")
+            if self.total_received:
+                self.auto_detect_protocol()
         self._set_status(f"DISCONNECTED · {UART_PORT}", "#ef626f")
         self.statusBar().showMessage(f"{reason} — Cắm lại cáp và nhấn 'Connect {UART_PORT}' để kết nối lại.")
 
@@ -1268,6 +1321,13 @@ class LogicAnalyzerWindow(QMainWindow):
         )
 
     def _rearm_fpga(self) -> None:
+        """Request the next FPGA capture block while remaining in LIVE mode.
+
+        Some FPGA designs send one finite BRAM block per RUN command. In that
+        case, _poll_serial() detects an idle gap after a complete block and
+        rearms the capture engine. If the FPGA streams continuously, no idle
+        gap is seen and this function is not called.
+        """
         if not (self.ser and self.ser.is_open and self.acquiring):
             return
         try:
@@ -1275,6 +1335,11 @@ class LogicAnalyzerWindow(QMainWindow):
             self.ser.write(build_command(CMD_RUN))
             self.ser.flush()
             self.batch_received = 0
+            self.last_rx_time = 0.0
+            self.rearm_count += 1
+            self.trigger_state_label.setText(
+                f"LIVE: yêu cầu block tiếp theo ({self.rearm_count:,})"
+            )
         except (serial.SerialException, OSError) as exc:
             self._handle_disconnect(f"Mất kết nối {UART_PORT} khi kích lại lấy mẫu ({exc})")
 
@@ -1293,7 +1358,6 @@ class LogicAnalyzerWindow(QMainWindow):
 
         if chunk:
             self.total_uart_bytes += len(chunk)
-            self.has_new_data = False
             if self.protocol_mode == "timestamp_data":
                 self._consume_timestamp_data_pairs(chunk)
             elif self.protocol_mode == "framed":
@@ -1301,12 +1365,18 @@ class LogicAnalyzerWindow(QMainWindow):
             elif self.protocol_mode == "raw":
                 # Optional mode for hardware that sends one sample byte per UART byte.
                 self._append_samples(chunk)
-
-            # Cứ có dữ liệu mới là vẽ lên đồ thị ngay lập tức, không chờ
-            if self.has_new_data:
-                self._refresh_plot()
-        # No re-arm loop here: once the selected sample count is reached,
-        # _append_samples schedules a STOP command automatically.
+        else:
+            # The current RTL may emit a finite BRAM block then wait. Once the
+            # configured number of samples has arrived and UART has been idle,
+            # request the next block. A truly continuous stream never hits this
+            # condition, so it is left untouched.
+            if (
+                self.batch_size > 0
+                and self.batch_received >= self.batch_size
+                and self.last_rx_time > 0.0
+                and (time.monotonic() - self.last_rx_time) >= BLOCK_REARM_IDLE_SECONDS
+            ):
+                self._rearm_fpga()
 
     # ----- Acquisition --------------------------------------------------------
 
@@ -1323,24 +1393,24 @@ class LogicAnalyzerWindow(QMainWindow):
             return
 
         self.sample_rate = int(self.rate_combo.currentData())
-        # converter.v sends two UART bytes per 16-bit word: timestamp [15:8],
-        # followed by logic sample DATA [7:0]. Do not use the old 5A A5 parser.
+        # converter.v sends [timestamp byte][8-bit DATA byte] for each sample.
         self.protocol_mode = "timestamp_data"
         self.rx_pair_buffer.clear()
         self.total_uart_bytes = 0
         self.total_pairs_received = 0
+        self.total_received = 0
+        self.rearm_count = 0
+
         trigger_channel = int(self.trigger_channel_combo.currentData())
         trigger_mode = int(self.trigger_mode_combo.currentData())
-
         pre_count = self._selected_pre_samples()
         post_count = self._selected_post_samples()
-        self.target_sample_count = max(1, pre_count + post_count)
-        self.batch_size = self.target_sample_count
-        self.batch_received = 0
-        self.total_received = 0
-        self.last_rx_time = 0.0
-        self.auto_stop_scheduled = False
 
+        # Pre + Post define the FPGA block length. The PC does NOT stop at this
+        # length: it appends all incoming blocks into a bounded sliding window.
+        self.batch_size = max(1, pre_count + post_count)
+        self.batch_received = 0
+        self.last_rx_time = 0.0
         self.parser.reset()
         self.raw_capture = None
         self.auto_follow = True
@@ -1366,17 +1436,23 @@ class LogicAnalyzerWindow(QMainWindow):
 
         self.acquiring = True
         self._set_running_ui(True)
-        self.trigger_state_label.setText("Trigger: đang thu & vẽ trực tiếp")
-        self.capture_label.setText("Đang chờ UART: mỗi mẫu gồm Timestamp + DATA")
-        self.statusBar().showMessage(
-            f"Đang nhận cặp [Timestamp][DATA] @ {UART_BAUDRATE} baud · "
-            f"Tự dừng khi đủ {self.target_sample_count:,} mẫu"
+        self.plot_timer.start()
+        selected_trigger_mode = int(self.trigger_mode_combo.currentData())
+        if selected_trigger_mode == 0:
+            self.trigger_state_label.setText("LIVE: đang nhận · không bật Trigger")
+        else:
+            selected_channel = int(self.trigger_channel_combo.currentData())
+            self.trigger_state_label.setText(
+                f"LIVE: chờ Trigger D{selected_channel} · {self.trigger_mode_combo.currentText()}"
+            )
+        self.capture_label.setText("LIVE · đang chờ dữ liệu")
+        self.capture_label.setToolTip(
+            f"Đang giữ tối đa {MAX_DISPLAY_SAMPLES:,} mẫu gần nhất trong RAM"
         )
-
-    def _auto_stop_if_complete(self) -> None:
-        self.auto_stop_scheduled = False
-        if self.acquiring and self.total_received >= self.target_sample_count:
-            self.stop_acquisition(send_command=True, automatic=True)
+        self.statusBar().showMessage(
+            f"LIVE @ {self.sample_rate:,} S/s · cửa sổ {MAX_DISPLAY_SAMPLES:,} mẫu · "
+            "RUN tiếp tục nhận, STOP đóng băng waveform"
+        )
 
     def stop_acquisition(self, send_command: bool = True, automatic: bool = False) -> None:
         was_acquiring = self.acquiring
@@ -1387,28 +1463,50 @@ class LogicAnalyzerWindow(QMainWindow):
             except (serial.SerialException, OSError):
                 self._handle_disconnect(f"Mất kết nối {UART_PORT} khi dừng")
                 return
+
         self.acquiring = False
         self._set_running_ui(False)
+        self.plot_timer.stop()
+        self.decoder_timer.stop()
+
         if was_acquiring:
             tail_note = " · còn 1 byte lẻ chưa đủ cặp" if self.rx_pair_buffer else ""
-            if automatic:
-                stop_text = f"Đã tự dừng · đủ {self.total_received:,}/{self.target_sample_count:,} mẫu"
-            else:
-                stop_text = f"Đã dừng thủ công · {self.total_received:,}/{self.target_sample_count:,} mẫu"
-            self.capture_label.setText(
+            stop_text = (
+                f"Đã STOP · đang giữ {len(self.capture_data):,} mẫu gần nhất "
+                f"(tổng đã nhận {self.total_received:,})"
+            )
+            self.capture_label.setText(f"STOP · giữ {len(self.capture_data):,} mẫu")
+            self.capture_label.setToolTip(
                 f"{stop_text} · {self.total_uart_bytes:,} byte UART{tail_note}"
             )
-            self.trigger_state_label.setText("Trigger: đã dừng")
-            self._refresh_plot()
+            self.trigger_state_label.setText("LIVE: đã đóng băng waveform")
+            if self.has_new_data:
+                self._flush_live_plot()
+            else:
+                self._refresh_plot()
             self.statusBar().showMessage(stop_text)
             if self.total_received:
-                # After a completed capture, run the protocol heuristic and
-                # populate the per-channel 3-column results table.
                 self.auto_detect_protocol()
 
+    def toggle_acquisition(self) -> None:
+        """Use one physical UI button for both RUN and STOP actions."""
+        if self.acquiring:
+            self.stop_acquisition(send_command=True)
+        else:
+            self.start_acquisition()
+
     def _set_running_ui(self, running: bool) -> None:
-        self.run_button.setEnabled(not running)
-        self.stop_button.setEnabled(running)
+        self.run_button.setText("■ STOP" if running else "▶ RUN")
+        self.run_button.setObjectName("stopButton" if running else "runButton")
+        self.run_button.setToolTip(
+            "Dừng nhận dữ liệu và giữ waveform hiện tại" if running
+            else "Bắt đầu nhận dữ liệu LIVE"
+        )
+        # Refresh the stylesheet selector after changing the button state.
+        self.run_button.style().unpolish(self.run_button)
+        self.run_button.style().polish(self.run_button)
+        self.run_button.update()
+        self.run_button.setEnabled(True)
         for widget in (
             self.rate_combo, self.pre_post_slider,
             self.trigger_channel_combo, self.trigger_mode_combo,
@@ -1430,9 +1528,7 @@ class LogicAnalyzerWindow(QMainWindow):
         self.rx_pair_buffer.extend(chunk)
         pair_count = len(self.rx_pair_buffer) // 2
         if pair_count == 0:
-            self.capture_label.setText(
-                f"Đã nhận {self.total_uart_bytes:,} byte UART · đang chờ byte DATA"
-            )
+            self.capture_label.setText("LIVE · đang ghép cặp UART")
             return
 
         complete_length = pair_count * 2
@@ -1448,31 +1544,114 @@ class LogicAnalyzerWindow(QMainWindow):
         if data_samples:
             self._append_samples(data_samples)
 
+    def _detect_trigger_in_payload(self, payload: bytes) -> None:
+        """Detect the selected trigger condition in DATA bytes.
+
+        This is a PC-side visual marker based on the same 8-bit samples used
+        for the waveform. Edge triggers mark a real 0->1 / 1->0 transition.
+        Level triggers mark the first sample entering the selected level.
+        Only the newest event is retained as the visible T marker.
+        """
+        if not payload or not self.acquiring:
+            return
+
+        channel = int(self.trigger_channel_combo.currentData())
+        mode = int(self.trigger_mode_combo.currentData())
+        if mode == 0:  # No trigger selected
+            return
+
+        previous = self.trigger_previous_bit
+        first_absolute_index = self.total_received
+        event_index: int | None = None
+
+        for offset, raw_sample in enumerate(payload):
+            current = (int(raw_sample) >> channel) & 1
+            matched = False
+
+            if mode == 1:  # Rising edge: 0 -> 1
+                matched = previous == 0 and current == 1
+            elif mode == 2:  # Falling edge: 1 -> 0
+                matched = previous == 1 and current == 0
+            elif mode == 3:  # HIGH level: entering HIGH
+                matched = current == 1 and (previous is None or previous == 0)
+            elif mode == 4:  # LOW level: entering LOW
+                matched = current == 0 and (previous is None or previous == 1)
+
+            if matched:
+                event_index = first_absolute_index + offset
+            previous = current
+
+        self.trigger_previous_bit = previous
+
+        if event_index is not None:
+            self.trigger_sample_index = event_index
+            self.trigger_event_count += 1
+            event_time_us = event_index / max(1.0, float(self.sample_rate)) * 1e6
+            mode_name = self.trigger_mode_combo.currentText()
+            self.trigger_state_label.setText(
+                f"Trigger D{channel}: {mode_name} · {event_time_us:.3f} µs · "
+                f"lần {self.trigger_event_count:,}"
+            )
+
+    def _update_trigger_marker(self, first_sample_index: int, sample_count: int) -> None:
+        """Place/hide the yellow trigger line according to the current sliding window."""
+        if self.trigger_marker is None or self.trigger_marker_label is None:
+            return
+
+        index = self.trigger_sample_index
+        if index is None or not (first_sample_index <= index < first_sample_index + sample_count):
+            self.trigger_marker.setVisible(False)
+            self.trigger_marker_label.setVisible(False)
+            return
+
+        trigger_time = index / max(1.0, float(self.sample_rate))
+        channel = int(self.trigger_channel_combo.currentData())
+        self.trigger_marker.setPos(trigger_time)
+        self.trigger_marker_label.setText(f"T · D{channel}")
+        self.trigger_marker_label.setPos(trigger_time, 11.72)
+        self.trigger_marker.setVisible(True)
+        self.trigger_marker_label.setVisible(True)
+
     def _append_samples(self, payload: bytes) -> None:
-        if not payload or self.total_received >= self.target_sample_count:
+        """Append samples to a fixed-size sliding window; never grow RAM forever."""
+        if not payload:
             return
 
-        remaining = self.target_sample_count - self.total_received
-        accepted = payload[:remaining]
-        if not accepted:
-            return
-
-        self.capture_data.extend(accepted)
-        overflow = len(self.capture_data) - MAX_DISPLAY_SAMPLES
-        if overflow > 0:
-            del self.capture_data[:overflow]
-
+        # Find trigger event positions before total_received is advanced.
+        # Absolute indices therefore stay correct even when the ring window rolls.
+        self._detect_trigger_in_payload(payload)
+        accepted = bytes(payload)
         n = len(accepted)
+        if n >= MAX_DISPLAY_SAMPLES:
+            self.capture_data[:] = accepted[-MAX_DISPLAY_SAMPLES:]
+        else:
+            self.capture_data.extend(accepted)
+            overflow = len(self.capture_data) - MAX_DISPLAY_SAMPLES
+            if overflow > 0:
+                del self.capture_data[:overflow]
+
         self.total_received += n
         self.batch_received += n
         self.last_rx_time = time.monotonic()
         self.has_new_data = True
         self._update_capture_labels()
 
-        if (self.acquiring and self.total_received >= self.target_sample_count
-                and not self.auto_stop_scheduled):
-            self.auto_stop_scheduled = True
-            QTimer.singleShot(0, self._auto_stop_if_complete)
+        # Protocol inference runs at a lower rate than serial polling so it
+        # cannot block continuous UART draining or waveform refresh.
+        if self.acquiring and not self.decoder_timer.isActive():
+            self.decoder_timer.start(LIVE_DECODE_INTERVAL_MS)
+
+    def _flush_live_plot(self) -> None:
+        """Refresh the waveform at a fixed frame rate, not once per UART read."""
+        if not self.has_new_data:
+            return
+        self.has_new_data = False
+        self._refresh_plot()
+
+    def _decode_live_snapshot(self) -> None:
+        """Decode the newest sample window periodically while LIVE is running."""
+        if self.acquiring and len(self.capture_data) >= 64:
+            self.auto_detect_protocol()
 
     def _on_framed_data(self, payload: bytes) -> None:
         if not self.acquiring or not payload:
@@ -1487,11 +1666,15 @@ class LogicAnalyzerWindow(QMainWindow):
 
     def _update_capture_labels(self) -> None:
         shown = len(self.capture_data)
-        self.sample_count_label.setText(f"{shown:,} mẫu (tổng {self.total_received:,})")
+        self.sample_count_label.setText(
+            f"{shown:,}/{MAX_DISPLAY_SAMPLES:,} mẫu trong cửa sổ · "
+            f"tổng {self.total_received:,}"
+        )
         if self.acquiring:
-            self.capture_label.setText(
+            self.capture_label.setText(f"LIVE · {shown:,}/{MAX_DISPLAY_SAMPLES:,} mẫu")
+            self.capture_label.setToolTip(
                 f"UART RX: {self.total_uart_bytes:,} byte · "
-                f"{self.total_received:,} mẫu DATA"
+                f"Tổng DATA đã nhận: {self.total_received:,} mẫu"
             )
         if self.sample_rate:
             dt_ns = 1e9 / self.sample_rate
@@ -1502,11 +1685,20 @@ class LogicAnalyzerWindow(QMainWindow):
     def _clear_waveform(self) -> None:
         self.capture_data.clear()
         self.rx_pair_buffer.clear()
+        self.trigger_previous_bit = None
+        self.trigger_sample_index = None
+        self.trigger_event_count = 0
+        if self.trigger_marker is not None:
+            self.trigger_marker.setVisible(False)
+        if self.trigger_marker_label is not None:
+            self.trigger_marker_label.setVisible(False)
         self.placeholder.setVisible(True)
         for curve in self.curves:
             curve.setData([], [])
             curve.setVisible(False)
         self.has_new_data = False
+        if hasattr(self, "decoder_timer"):
+            self.decoder_timer.stop()
         if hasattr(self, "decoder_table"):
             self._reset_decoder_table()
         self.sample_count_label.setText("0 mẫu")
@@ -1537,12 +1729,19 @@ class LogicAnalyzerWindow(QMainWindow):
             return
 
         dt_s = 1.0 / max(1.0, float(self.sample_rate))
-        x_edges = np.arange(count + 1, dtype=np.float64) * dt_s
+        first_sample_index = max(0, self.total_received - count)
+        x_edges = (first_sample_index + np.arange(count + 1, dtype=np.float64)) * dt_s
         self.placeholder.setVisible(False)
+        self._update_trigger_marker(first_sample_index, count)
 
         if self.auto_follow:
-            xmax = max(dt_s * count, dt_s)
-            self.view_box.setXRange(0.0, xmax, padding=0.015)
+            # Grow the visible time range while the buffer fills; once it reaches
+            # MAX_DISPLAY_SAMPLES, keep a fixed-width sliding window following LIVE data.
+            visible_samples = max(1, min(count, MAX_DISPLAY_SAMPLES))
+            window_seconds = visible_samples * dt_s
+            xmax = max(dt_s, self.total_received * dt_s)
+            xmin = max(0.0, xmax - window_seconds)
+            self.view_box.setXRange(xmin, xmax, padding=0.015)
 
         visible_channels = 0
         try:
@@ -1575,8 +1774,10 @@ class LogicAnalyzerWindow(QMainWindow):
                 visible_channels += 1
 
             self.plot.update()
+            mode_text = "LIVE" if self.acquiring else "Đã đóng băng"
             self.statusBar().showMessage(
-                f"Đang hiển thị {count:,} mẫu DATA trên {visible_channels}/8 kênh"
+                f"{mode_text} · hiển thị {count:,}/{MAX_DISPLAY_SAMPLES:,} mẫu · "
+                f"{visible_channels}/8 kênh"
             )
         except Exception as exc:
             # Surface rendering errors instead of leaving an empty plot with
@@ -1600,8 +1801,12 @@ class LogicAnalyzerWindow(QMainWindow):
         self.auto_follow = True
         count = len(self.capture_data)
         if count:
-            duration = count / float(self.sample_rate)
-            self.view_box.setXRange(0, max(duration, 1e-12), padding=0.015)
+            dt_s = 1.0 / max(1.0, float(self.sample_rate))
+            visible_samples = max(1, min(count, MAX_DISPLAY_SAMPLES))
+            window_seconds = visible_samples * dt_s
+            xmax = max(dt_s, self.total_received * dt_s)
+            xmin = max(0.0, xmax - window_seconds)
+            self.view_box.setXRange(xmin, xmax, padding=0.015)
         else:
             self.view_box.setXRange(0, 1e-5, padding=0)
 
