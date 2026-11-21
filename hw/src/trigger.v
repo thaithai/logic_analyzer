@@ -1,45 +1,57 @@
-module trigger (
+module trigger #(parameter DATA_WIDTH = 8)(
     input  clk,
     input  rst_n,
-    
-    // Giao tiếp cấu hình từ Controller
-    input  enable,       // Bật/tắt tính năng trigger
-    input  edge_detect,  // 1: Cạnh lên (Rising), 0: Cạnh xuống (Falling)
-    input  [2:0] channel,      // Chọn kênh cần theo dõi (0 đến 7 cho bus 8-bit)
-    
-    // Dữ liệu và Timestamp đầu vào
-    input  [7:0] data,         // Dữ liệu từ input_sync
-    input  [7:0] timestamp,    // Timestamp hiện tại
-    
+
+    // 00: logic 0, 01: logic 1, 10: cạnh lên, 11: cạnh xuống
+    input  enable,
+    input  [1:0] trigger_condition,
+    input  [2:0] channel,
+
+    // Dữ liệu và tín hiệu lấy mẫu
+    input  [DATA_WIDTH-1:0] data,
+    input  clk_scale,
+
     // Ngõ ra kết nối với Buffer
-    output reg        trigger_detect, // Cờ báo đã phát hiện trigger// cần check
-    output reg [7:0]  config_out    // Gói cấu hình chuyển sang buffer (nếu cần)
+    output event_pulse,
+    output reg trigger_detect
 );
 
-    reg prev_bit;
-    wire target_bit;
+    reg  [DATA_WIDTH-1:0] prev_data;
+    wire       selected_bit;
+    reg        trigger_match;
 
-    // Trích xuất bit cần quan sát dựa trên channel (3 bit chọn 1 trong 8 đường data)
-    assign target_bit = data[channel];
+    assign selected_bit = data[channel];
+
+    // Báo có thay đổi dữ liệu tại thời điểm lấy mẫu.
+    assign event_pulse = (data != prev_data) && clk_scale;
+
+    // Kiểm tra điều kiện trigger trên kênh đã chọn.
+    always @(*) begin
+        case (trigger_condition)
+            2'b00:   trigger_match = ~selected_bit;              // Logic 0
+            2'b01:   trigger_match =  selected_bit;               // Logic 1
+            2'b10:   trigger_match =  selected_bit & ~prev_data[channel]; // Cạnh lên
+            2'b11:   trigger_match = ~selected_bit &  prev_data[channel]; // Cạnh xuống
+            default: trigger_match = 1'b0;
+        endcase
+    end
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
+            prev_data     <= 8'b0;
             trigger_detect <= 1'b0;
-            prev_bit       <= 1'b0;
-            config_out     <= 8'd0;
         end else begin
-            prev_bit <= target_bit;
-            
-            if (enable && !trigger_detect) begin
-                // Phát hiện sườn lên hoặc sườn xuống tùy theo cấu hình edge_detect
-                if (edge_detect && (~prev_bit & target_bit)) begin
-                    trigger_detect <= 1'b1; // Sườn lên (0 -> 1)
-                end else if (!edge_detect && (prev_bit & ~target_bit)) begin
-                    trigger_detect <= 1'b1; // Sườn xuống (1 -> 0)
-                end
-            end else if (!enable) begin
-                trigger_detect <= 1'b0; // Reset trạng thái trigger khi disable
+            // Cập nhật dữ liệu trước ở mỗi chu kỳ lấy mẫu,
+            // kể cả khi trigger đang bị tắt.
+            if (clk_scale)
+                prev_data <= data;
+
+            if (!enable) begin
+                trigger_detect <= 1'b0;
+            end else if (clk_scale && trigger_match) begin
+                trigger_detect <= 1'b1;
             end
         end
     end
+
 endmodule

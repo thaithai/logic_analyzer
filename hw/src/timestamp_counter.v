@@ -1,8 +1,7 @@
 module timestamp_counter (
     input  clk,          
     input  rst_n,        // Reset tích cực mức thấp
-    //input  enable,       // Cho phép đếm
-    input clk_scale,
+    input  clk_scale,
     output reg [7:0]  timestamp     // Giá trị mốc thời gian 8-bit
 );
 

@@ -4,7 +4,6 @@ module clock_divider (
     input [15:0] scale,
     output reg  clk_scale         // Clock sau khi chia tần
 );
-
     reg [31:0] counter;
 
     always @(posedge clk or negedge rst_n) begin

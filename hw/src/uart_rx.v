@@ -1,11 +1,9 @@
-// Note: cần sửa lại toàn bộ uart
-// 
-module uart_rx #( // xem lại sau khi check uart rx (mục tiêu uart rx là để giải mã lệnh cấu hình từ PC)
+module uart_rx #( 
     parameter CLKS_PER_BIT = 434
 )(
-    input  wire       clk,
-    input  wire       rst_n,
-    input  wire       rx,          // Chân nhận dữ liệu nối tiếp UART RX từ phần cứng
+    input       clk,
+    input       rst_n,
+    input       rx,          // Chân nhận dữ liệu nối tiếp UART RX từ phần cứng
     output reg        rx_dv,       // Cờ báo có dữ liệu mới nhận hợp lệ (1 chu kỳ clock)
     output reg  [7:0] rx_data      // Dữ liệu 8-bit nhận được
 );

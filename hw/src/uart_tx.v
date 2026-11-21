@@ -1,4 +1,4 @@
-module uart_tx #( // cần xem lại logic của uart (ưu tiên uart tx để truyền data lên PC)
+module uart_tx #( 
     parameter CLKS_PER_BIT = 434 // Tính bằng: Tần số Clock / Baudrate (Ví dụ: 50MHz / 115200 ≈ 434)
 )(
     input  wire       clk,
